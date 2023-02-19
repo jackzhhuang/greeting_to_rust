@@ -1,46 +1,103 @@
-use std::sync::{mpsc::sync_channel, Mutex, mpsc::SyncSender, mpsc::Receiver};
+use std::{sync::{mpsc::sync_channel, 
+                Mutex, 
+                mpsc::SyncSender, 
+                mpsc::Receiver, Arc}, task::Context};
 use async_std::task::block_on;
-use futures::FutureExt;
-use futures::future::BoxFuture;
+use futures::{
+    Future,
+    future::{
+        BoxFuture,
+    },
+    task::{
+        ArcWake,
+        waker_ref,
+        Waker,
+        Poll,
+    }, FutureExt
+};
 use std::thread;
 
 struct Task<T> {
-    fut: Mutex<BoxFuture<'static, T>>,
+    fut: Mutex<Option<BoxFuture<'static, T>>>,
 }
 
 impl<T> Task<T> {
     pub fn new(f: BoxFuture<'static, T>) -> Self {
         Task {
-            fut: Mutex::new(f),
+            fut: Mutex::new(Some(f)),
         }
     }
 }
 
-async fn say_hello() -> String {
-    println!("hello");
-    String::from("hello")
+impl<T> ArcWake for Task<T> {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        todo!()
+    }
 }
 
-async fn say_world() -> String {
-    println!("world");
-    String::from("world")
+struct SayHelloInPending {
+    shared_data: Arc<Mutex<SharedData>>,
 }
 
-async fn say_bye() -> String {
-    println!("bye");
-    String::from("bye")
+struct SharedData {
+    milli_seconds: u64,
+    completed: bool,
+    waker: Option<Waker>,
 }
 
-async fn excutor(queue: Receiver<Task<String>>) {
-    let mut count = 0;
+impl SayHelloInPending {
+   fn new(milli_seconds: u64) -> Self  {
+        let task = SayHelloInPending { 
+            shared_data: Arc::new(Mutex::new(SharedData { 
+                milli_seconds, 
+                completed: false, 
+                waker: None 
+            })) 
+        };
+        let shared_data_clone = Arc::clone(&task.shared_data);
+        std::thread::spawn(move || {
+            let mut data = shared_data_clone.lock().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(data.milli_seconds));
+            data.completed = true;
+            if let Some(w) = data.waker.take() {
+                w.wake();
+            }
+        });
+        task
+   }
+}
+
+impl Future for SayHelloInPending {
+    type Output = String;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let shared_data = self.shared_data.lock();
+        if let Ok(mut data) = shared_data {
+            if data.completed {
+                return Poll::Ready("completed".to_string());
+            } else {
+                data.waker = Some(cx.waker().clone());
+            }         
+        }
+        Poll::Pending
+    }
+}
+
+async fn excutor(queue: Receiver<Arc<Task<String>>>) {
     loop {
         match queue.recv() {
            Ok(task) => {
-                let r = task.fut.lock().unwrap().as_mut().await;
-                println!("await return: {}", r);
-                count += 1;
-                if count == 3 {
-                    return ;
+                let waker = waker_ref(&task);
+                let contex = &mut Context::from_waker(&waker);
+                let mut fut = task.fut.lock().unwrap();
+                if let Some(mut f) = fut.take() {
+                    let result = f.as_mut().poll(contex);
+                    if  result.is_pending() {
+                        *fut = Some(f);
+                    } else if let Poll::Ready(s) = result {
+                        println!("finish and receive: {}", s);
+                        break;
+                    }
                 }
            } 
            Err(_) =>  {
@@ -52,37 +109,13 @@ async fn excutor(queue: Receiver<Task<String>>) {
 
 fn main() {
     // 创建消息队列
-    let (sender, queue) = sync_channel::<Task<String>>(10);
+    let (sender, queue) = sync_channel::<Arc<Task<String>>>(10);
 
     // 创建三个即将被异步调用的函数，其返回 future
-    let hello_fut = say_hello();
-    let world_fut = say_world();
-    let bye_fut = say_bye();
+    let task = Task::<String>::new(SayHelloInPending::new(10 * 1000).boxed());
 
-    // 创建三个Task，存放之前三个函数的future
-    let t1 = Task::new(hello_fut.boxed());
-    let t2 = Task::new(world_fut.boxed());
-    let t3 = Task::new(bye_fut.boxed());
-
-    // 以下创建三个生产者线程，用以模拟多个IO生产的数据操作
-    // 第一个生产者线程
-    let sender1 = sender.clone();
-    thread::spawn(move || {
-        sender1.send(t1).unwrap();
-    }); 
-
-    // 第二个生产者线程
-    let sender2 = sender.clone();
-    thread::spawn(move || {
-        sender2.send(t2).unwrap();
-    }); 
-
-    // 第三个生产者线程
-    let sender3 = sender.clone();
-    thread::spawn(move || {
-        sender3.send(t3).unwrap();
-    }); 
-
+    sender.send(Arc::new(task)).unwrap();
+    
     // 执行消费者工作，从队列中取出Task，触发await
     block_on(excutor(queue));
 }
