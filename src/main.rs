@@ -116,12 +116,11 @@ fn main() {
     // 创建消息队列
     let (sender, queue) = sync_channel::<Arc<Task<String>>>(10);
 
-    // 创建三个即将被异步调用的函数，其返回 future
     let mut task = Task::<String>::new(sender.clone(), 
                                                      SayHelloInPending::new(2 * 1000).boxed());
 
+
     sender.send(Arc::new(task)).unwrap();
     
-    // 执行消费者工作，从队列中取出Task，触发await
     block_on(excutor(queue));
 }
