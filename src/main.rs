@@ -19,19 +19,21 @@ use std::thread;
 
 struct Task<T> {
     fut: Mutex<Option<BoxFuture<'static, T>>>,
+    sender: SyncSender<Arc<Task<T>>>,
 }
 
 impl<T> Task<T> {
-    pub fn new(f: BoxFuture<'static, T>) -> Self {
+    pub fn new(sender: SyncSender<Arc<Task<T>>>, f: BoxFuture<'static, T>) -> Self {
         Task {
             fut: Mutex::new(Some(f)),
+            sender,
         }
     }
 }
 
 impl<T> ArcWake for Task<T> {
     fn wake_by_ref(arc_self: &Arc<Self>) {
-        todo!()
+        arc_self.sender.send(arc_self.clone()).expect("failed to send task");
     }
 }
 
@@ -40,27 +42,28 @@ struct SayHelloInPending {
 }
 
 struct SharedData {
-    milli_seconds: u64,
     completed: bool,
     waker: Option<Waker>,
 }
 
 impl SayHelloInPending {
-   fn new(milli_seconds: u64) -> Self  {
+   fn new(millis: u64) -> Self  {
         let task = SayHelloInPending { 
             shared_data: Arc::new(Mutex::new(SharedData { 
-                milli_seconds, 
                 completed: false, 
                 waker: None 
             })) 
         };
         let shared_data_clone = Arc::clone(&task.shared_data);
         std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(millis));
             let mut data = shared_data_clone.lock().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(data.milli_seconds));
             data.completed = true;
             if let Some(w) = data.waker.take() {
+                println!("wake??");
                 w.wake();
+            } else {
+                println!("no wake??");
             }
         });
         task
@@ -71,7 +74,9 @@ impl Future for SayHelloInPending {
     type Output = String;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        println!("poll!!??");
         let shared_data = self.shared_data.lock();
+        println!("lock poll!!??");
         if let Ok(mut data) = shared_data {
             if data.completed {
                 return Poll::Ready("completed".to_string());
@@ -88,7 +93,7 @@ async fn excutor(queue: Receiver<Arc<Task<String>>>) {
         match queue.recv() {
            Ok(task) => {
                 let waker = waker_ref(&task);
-                let contex = &mut Context::from_waker(&waker);
+                let contex = &mut Context::from_waker(&*waker);
                 let mut fut = task.fut.lock().unwrap();
                 if let Some(mut f) = fut.take() {
                     let result = f.as_mut().poll(contex);
@@ -112,7 +117,8 @@ fn main() {
     let (sender, queue) = sync_channel::<Arc<Task<String>>>(10);
 
     // 创建三个即将被异步调用的函数，其返回 future
-    let task = Task::<String>::new(SayHelloInPending::new(10 * 1000).boxed());
+    let mut task = Task::<String>::new(sender.clone(), 
+                                                     SayHelloInPending::new(2 * 1000).boxed());
 
     sender.send(Arc::new(task)).unwrap();
     
