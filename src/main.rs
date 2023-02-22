@@ -88,7 +88,7 @@ impl Future for SayHelloInPending {
     }
 }
 
-async fn excutor(queue: Receiver<Arc<Task<String>>>) {
+async fn executor(queue: Receiver<Arc<Task<String>>>) {
     loop {
         match queue.recv() {
            Ok(task) => {
@@ -116,11 +116,11 @@ fn main() {
     // 创建消息队列
     let (sender, queue) = sync_channel::<Arc<Task<String>>>(10);
 
-    let mut task = Task::<String>::new(sender.clone(), 
+    let task = Task::<String>::new(sender.clone(), 
                                                      SayHelloInPending::new(2 * 1000).boxed());
 
 
     sender.send(Arc::new(task)).unwrap();
     
-    block_on(excutor(queue));
+    block_on(executor(queue));
 }
